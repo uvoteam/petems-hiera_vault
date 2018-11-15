@@ -1,9 +1,7 @@
-#
-# TODO:
-#   - Figure out why this works with puppet apply and not puppet agent -t
-#   - Look into caching values
-#   - Test the options: default_field, default_field_behavior, and default_field_parse
-#
+
+require 'pathname'
+require 'puppet/file_system'
+require 'puppet/network/http_pool'
 
 Puppet::Functions.create_function(:hiera_vault) do
 
@@ -12,26 +10,12 @@ Puppet::Functions.create_function(:hiera_vault) do
   rescue LoadError => e
     raise Puppet::DataBinding::LookupError, "[hiera-vault] Must install json gem to use hiera-vault backend"
   end
-  begin
-    require 'vault'
-  rescue LoadError => e
-    raise Puppet::DataBinding::LookupError, "[hiera-vault] Must install vault gem to use hiera-vault backend"
-  end
-  begin
-    require 'debouncer'
-  rescue LoadError => e
-    raise Puppet::DataBinding::LookupError, "[hiera-vault] Must install debouncer gem to use hiera-vault backend"
-  end
-
 
   dispatch :lookup_key do
     param 'Variant[String, Numeric]', :key
     param 'Hash', :options
     param 'Puppet::LookupContext', :context
   end
-
-  @@vault    = Vault::Client.new
-  @@shutdown = Debouncer.new(10) { @@vault.shutdown() }
 
   def lookup_key(key, options, context)
 
@@ -61,21 +45,23 @@ Puppet::Functions.create_function(:hiera_vault) do
     end
 
     if ENV['VAULT_TOKEN'] == 'IGNORE-VAULT'
-      return context.not_found
+      context.not_found
     end
 
     result = vault_get(key, options, context)
 
-    # Allow hiera to look beyond vault if the value is not found
-    continue_if_not_found = options['continue_if_not_found'] || false
-
-    if result.nil? and continue_if_not_found
+    if result.nil? and options['continue_if_not_found']
       context.not_found
     else
       return result
     end
   end
 
+  VAULT_JSON_OPTIONS = {
+    max_nesting:      false,
+    create_additions: false,
+    symbolize_names:  false,
+  }
 
   def vault_get(key, options, context)
 
@@ -88,54 +74,83 @@ Puppet::Functions.create_function(:hiera_vault) do
     end
 
     begin
-      @@vault.configure do |config|
-        config.address = options['address'] unless options['address'].nil?
-        config.token = options['token'] unless options['token'].nil?
-        config.ssl_pem_file = options['ssl_pem_file'] unless options['ssl_pem_file'].nil?
-        config.ssl_verify = options['ssl_verify'] unless options['ssl_verify'].nil?
-        config.ssl_ca_cert = options['ssl_ca_cert'] if config.respond_to? :ssl_ca_cert
-        config.ssl_ca_path = options['ssl_ca_path'] if config.respond_to? :ssl_ca_path
-        config.ssl_ciphers = options['ssl_ciphers'] if config.respond_to? :ssl_ciphers
+      token = options.fetch('token', ENV['VAULT_TOKEN'])
+      token ||= Puppet::FileSystem.read(Pathname.new('~/.vault-token').expand_path)
+      headers = {
+        'User-Agent'    => 'puppetserver/hiera_vault',
+        'X-Vault-Token' => token,
+        'Content-Type'  => 'application/json',
+        'Accept'        => 'application/json',
+      }
+
+      url = URI.parse(options.fetch('address', ENV['VAULT_ADDR']))
+      connection = Puppet::Network::HttpPool.http_ssl_instance(url.host, url.port)
+
+      connection.verify_mode = options['ssl_verify'] ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
+      connection.ca_file = options['ssl_ca_cert']
+      connection.ca_path = options['ssl_ca_path']
+      connection.ciphers = options['ssl_ciphers']
+      if options['ssl_pem_file']
+        pem = Puppet::FileSystem.read(Pathname.new(options['ssl_pem_file']).expand_path)
+        connection.cert = OpenSSL::X509::Certificate.new(pem)
+        connection.key  = OpenSSL::PKey::RSA.new(pem, ENV['VAULT_SSL_CERT_PASSPHRASE'])
       end
 
-      if @@vault.sys.seal_status.sealed?
-        raise Puppet::DataBinding::LookupError, "[hiera-vault] vault is sealed"
-      end
-
-      context.explain { "[hiera-vault] Client configured to connect to #{@@vault.address}" }
+      context.explain { "[hiera-vault] Client configured to connect to #{url}" }
     rescue StandardError => e
-      @@shutdown.call
-      @@vault = nil
       raise Puppet::DataBinding::LookupError, "[hiera-vault] Skipping backend. Configuration error: #{e}"
     end
 
     answer = nil
 
     generic = options['mounts']['generic'].dup
-    generic ||= [ '/secret' ]
+    generic ||= [ 'secret' ]
+
+    v2 = options['kv_v2']
 
     # Only generic mounts supported so far
     generic.each do |mount|
-      path = context.interpolate(File.join(mount, key))
+      path = context.interpolate([mount, key].join('/'))
       context.explain { "[hiera-vault] Looking in path #{path}" }
+      if v2
+        path = path.split('/').reject(&:empty?).insert(1,'data').join('/')
+      end
 
       begin
-        secret = @@vault.logical.read(path)
-      rescue Vault::HTTPConnectionError
-        context.explain { "[hiera-vault] Could not connect to read secret: #{path}" }
-      rescue Vault::HTTPError => e
-        context.explain { "[hiera-vault] Could not read secret #{path}: #{e.errors.join("\n").rstrip}" }
+        result = connection.get("/v1/#{path}", headers, options)
+      rescue StandardError => e
+        context.explain { "[hiera-vault] Error reading secret #{path}: #{e}" }
+      end
+
+      if result.body
+        begin
+          data = JSON.parse(result.body, VAULT_JSON_OPTIONS)
+        rescue JSON::ParserError => e
+          context.explain { "[hiera-vault] Could not parse vault response as json: #{e}" }
+        end
+      end
+
+      if data
+        case result
+        when Net::HTTPSuccess
+          secret = data['data']
+          if v2
+            secret = secret['data']
+          end
+        else
+          context.explain { "[hiera-vault] Could not connect to read secret: #{path} (#{data.fetch('errors', ['unknown error']).join("\n")})" }
+        end
       end
 
       next if secret.nil?
 
       context.explain { "[hiera-vault] Read secret: #{key}" }
       if (options['default_field'] and ( ['ignore', nil].include?(options['default_field_behavior']) ||
-         (secret.data.has_key?(options['default_field'].to_sym) && secret.data.length == 1) ) )
+         (secret.has_key?(options['default_field']) && secret.length == 1) ) )
 
-        return nil if ! secret.data.has_key?(options['default_field'].to_sym)
+        return nil if ! secret.has_key?(options['default_field'])
 
-        new_answer = secret.data[options['default_field'].to_sym]
+        new_answer = secret[options['default_field']]
 
         if options['default_field_parse'] == 'json'
           begin
@@ -146,9 +161,7 @@ Puppet::Functions.create_function(:hiera_vault) do
         end
 
       else
-        # Turn secret's hash keys into strings allow for nested arrays and hashes
-        # this enables support for create resources etc
-        new_answer = secret.data.inject({}) { |h, (k, v)| h[k.to_s] = stringify_keys v; h }
+        new_answer = secret
       end
 
       if ! new_answer.nil?
@@ -157,24 +170,6 @@ Puppet::Functions.create_function(:hiera_vault) do
       end
     end
 
-    answer = context.not_found if answer.nil?
-    @@shutdown.call
     return answer
-  end
-
-  # Stringify key:values so user sees expected results and nested objects
-  def stringify_keys(value)
-    case value
-    when String
-      value
-    when Hash
-      result = {}
-      value.each_pair { |k, v| result[k.to_s] = stringify_keys v }
-      result
-    when Array
-      value.map { |v| stringify_keys v }
-    else
-      value
-    end
   end
 end

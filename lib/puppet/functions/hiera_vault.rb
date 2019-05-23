@@ -75,26 +75,24 @@ Puppet::Functions.create_function(:hiera_vault) do
 
     begin
       token = options.fetch('token', ENV['VAULT_TOKEN'])
-      token ||= Puppet::FileSystem.read(Pathname.new('~/.vault-token').expand_path)
+      if token.nil? or token.empty?
+        tokenfile = Pathname.new('~/.vault-token').expand_path
+        if Puppet::FileSystem.exist? tokenfile
+          token = Puppet::FileSystem.read tokenfile
+        end
+      end
+
       headers = {
         'User-Agent'    => 'puppetserver/hiera_vault',
-        'X-Vault-Token' => token,
         'Content-Type'  => 'application/json',
         'Accept'        => 'application/json',
       }
+      unless token.nil?
+        headers['X-Vault-Token'] = token
+      end
 
       url = URI.parse(options.fetch('address', ENV['VAULT_ADDR']))
-      connection = Puppet::Network::HttpPool.http_ssl_instance(url.host, url.port)
-
-      connection.verify_mode = options['ssl_verify'] ? OpenSSL::SSL::VERIFY_PEER : OpenSSL::SSL::VERIFY_NONE
-      connection.ca_file = options['ssl_ca_cert']
-      connection.ca_path = options['ssl_ca_path']
-      connection.ciphers = options['ssl_ciphers']
-      if options['ssl_pem_file']
-        pem = Puppet::FileSystem.read(Pathname.new(options['ssl_pem_file']).expand_path)
-        connection.cert = OpenSSL::X509::Certificate.new(pem)
-        connection.key  = OpenSSL::PKey::RSA.new(pem, ENV['VAULT_SSL_CERT_PASSPHRASE'])
-      end
+      connection = Puppet::Network::HttpPool.http_instance(url.host, url.port)
 
       context.explain { "[hiera-vault] Client configured to connect to #{url}" }
     rescue StandardError => e

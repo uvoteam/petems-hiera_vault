@@ -92,7 +92,7 @@ Puppet::Functions.create_function(:hiera_vault) do
       end
 
       url = URI.parse(options.fetch('address', ENV['VAULT_ADDR']))
-      connection = Puppet::Network::HttpPool.http_instance(url.host, url.port)
+      connection = Puppet::Network::HttpPool.http_instance(url.host, url.port, false)
 
       context.explain { "[hiera-vault] Client configured to connect to #{url}" }
     rescue StandardError => e
